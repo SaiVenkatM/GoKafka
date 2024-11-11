@@ -41,6 +41,12 @@ var apiKeys = []APIKey{
         MaxVersion:  0,
         TaggedField: 0,
     },
+    {
+		Key:         1, //  Fetch API
+		MinVersion:  0,
+		MaxVersion:  16,
+		TaggedField: 0,
+	},
 }
 
 func readMessage(conn net.Conn) (*Message, error) {
