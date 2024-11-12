@@ -3,17 +3,11 @@ package main
 import (
     "encoding/binary"
     "fmt"
+    "io"
     "net"
     "os"
-    "io"
 )
 
-type Message struct {
-    Error         int16
-    CorrelationID int32
-}
-
-// Added new struct to represent API Keys
 type APIKey struct {
     Key         uint16
     MinVersion  uint16
@@ -22,10 +16,25 @@ type APIKey struct {
 }
 
 const (
-    ErrUnsupportedVersion int16  = 35
-    DefaultPort                  = "9092"
+    ErrUnsupportedVersion int16 = 35
+    DefaultPort                 = "9092"
     DefaultAddr                 = "0.0.0.0"
+    ErrUnknown            int16 = 0
 )
+
+const (
+    API_VERSION_REQUEST uint16 = 18
+    FETCH_REQUEST       uint16 = 1
+
+    ERROR_UNSUPPORTED_VERSION = 35
+)
+
+type Message struct {
+    CorrelationID int32
+    APIKey        int16
+    Version       int16
+    Error         int16
+}
 
 // Predefined API keys
 var apiKeys = []APIKey{
@@ -42,138 +51,149 @@ var apiKeys = []APIKey{
         TaggedField: 0,
     },
     {
-		Key:         1, //  Fetch API
-		MinVersion:  0,
-		MaxVersion:  16,
-		TaggedField: 0,
-	},
+        Key:         1, //  Fetch API
+        MinVersion:  0,
+        MaxVersion:  16,
+        TaggedField: 0,
+    },
 }
 
 func readMessage(conn net.Conn) (*Message, error) {
-    var tmp32, length int32
-    var tmp16 int16
-
-    out := Message{}
-
-    err := binary.Read(conn, binary.BigEndian, &length)
+    // Read message size
+    messageSizeField := make([]byte, 4)
+    _, err := io.ReadFull(conn, messageSizeField)
     if err != nil {
         if err == io.EOF {
             return nil, err
         }
-        return nil, fmt.Errorf("error reading message length: %v", err)
+        return nil, fmt.Errorf("error reading message size: %v", err)
     }
 
-    // Header
-    if err := binary.Read(conn, binary.BigEndian, &tmp16); err != nil {
-        return nil, fmt.Errorf("error reading header field 1: %v", err)
-    }
-    if err := binary.Read(conn, binary.BigEndian, &tmp16); err != nil {
-        return nil, fmt.Errorf("error reading header field 2: %v", err)
-    }
-    if err := binary.Read(conn, binary.BigEndian, &tmp32); err != nil {
-        return nil, fmt.Errorf("error reading correlation ID: %v", err)
-    }
-    out.CorrelationID = tmp32
-
-    if tmp16 < 0 || tmp16 > 4 {
-        out.Error = ErrUnsupportedVersion
-    }
-
-    // Body
-    tmp := make([]byte, length-8)
-    _, err = io.ReadFull(conn, tmp)
+    // Read the complete message
+    messageSize := binary.BigEndian.Uint32(messageSizeField)
+    message := make([]byte, messageSize)
+    _, err = io.ReadFull(conn, message)
     if err != nil {
-        return nil, fmt.Errorf("error reading message body: %v", err)
+        return nil, fmt.Errorf("error reading message: %v", err)
     }
 
-    return &out, nil
+    // Parse header fields
+    apiKey := binary.BigEndian.Uint16(message[0:2])
+    version := int16(binary.BigEndian.Uint16(message[2:4]))
+    correlationID := binary.BigEndian.Uint32(message[4:8])
+
+    out := &Message{
+        APIKey:        int16(apiKey),
+        CorrelationID: int32(correlationID),
+        Version:       version,
+    }
+
+    // Check version support for API Versions request
+    if apiKey == API_VERSION_REQUEST {
+        if version < 0 || version > 4 {
+            out.Error = ERROR_UNSUPPORTED_VERSION
+        }
+    }
+
+    return out, nil
 }
 
-func createResponse(correlationID int32) []byte {
-    // Calculate total size needed for the response
-    totalSize := 4 + // Correlation ID
-                2 + // Error Code
-                1 + // Number of API Keys
-                (len(apiKeys) * 7) + // Each API Key entry (2+2+2+1 bytes)
-                4 + // Throttle time
-                1   // Final tagged fields
+func handleFetchResponse(correlationID int32) []byte {
+    response := []byte{}
 
-    out := make([]byte, totalSize)
-    offset := 0
+    // Correlation ID (4 bytes)
+    response = binary.BigEndian.AppendUint32(response, uint32(correlationID))
 
-    // Write correlation ID
-    binary.BigEndian.PutUint32(out[offset:], uint32(correlationID))
-    offset += 4
+    // TAG_BUFFER
+    response = append(response, 0)
 
-    // Write error code (0 = no error)
-    binary.BigEndian.PutUint16(out[offset:], 0)
-    offset += 2
+    // Throttle time (4 bytes)
+    response = binary.BigEndian.AppendUint32(response, 0)
 
-    // Write number of API keys
-    out[offset] = byte(len(apiKeys)) + 1 // Add 1 as per format
-    offset++
+    // Error code (2 bytes)
+    response = binary.BigEndian.AppendUint16(response, 0)
 
-    // Write each API key entry
-    for _, api := range apiKeys {
-        binary.BigEndian.PutUint16(out[offset:], api.Key)
-        offset += 2
-        binary.BigEndian.PutUint16(out[offset:], api.MinVersion)
-        offset += 2
-        binary.BigEndian.PutUint16(out[offset:], api.MaxVersion)
-        offset += 2
-        out[offset] = api.TaggedField
-        offset++
-    }
+    // Session ID (4 bytes)
+    response = binary.BigEndian.AppendUint32(response, 0)
 
-    // Write throttle time (4 bytes of zeros)
-    binary.BigEndian.PutUint32(out[offset:], 0)
-    offset += 4
+    // Responses array length (0)
+    response = append(response, 0)
 
-    // Write final tagged fields
-    out[offset] = 0
+    // Final TAG_BUFFER
+    response = append(response, 0)
 
-    return out
+    // Prepend size
+    size := make([]byte, 4)
+    binary.BigEndian.PutUint32(size, uint32(len(response)))
+    return append(size, response...)
 }
 
-func sendResponse(c net.Conn, b []byte) error {
-    if err := binary.Write(c, binary.BigEndian, int32(len(b))); err != nil {
-        return fmt.Errorf("error writing response length: %v", err)
+func createApiVersionsResponse(correlationID int32, errorCode int16) []byte {
+    response := []byte{}
+
+    // Correlation ID
+    response = binary.BigEndian.AppendUint32(response, uint32(correlationID))
+
+    // Error code
+    response = binary.BigEndian.AppendUint16(response, uint16(errorCode))
+
+    if errorCode == 0 {
+        // Number of API keys
+        response = append(response, 3)
+
+        // API Version Key entry
+        response = binary.BigEndian.AppendUint16(response, API_VERSION_REQUEST)
+        response = binary.BigEndian.AppendUint16(response, 0) // Min version
+        response = binary.BigEndian.AppendUint16(response, 4) // Max version
+        response = append(response, 0)                        // TAG_BUFFER
+
+        // Fetch API Key entry
+        response = binary.BigEndian.AppendUint16(response, FETCH_REQUEST)
+        response = binary.BigEndian.AppendUint16(response, 0)  // Min version
+        response = binary.BigEndian.AppendUint16(response, 16) // Max version
+        response = append(response, 0)                         // TAG_BUFFER
+
+        // Throttle time
+        response = binary.BigEndian.AppendUint32(response, 0)
+
+        // Final TAG_BUFFER
+        response = append(response, 0)
     }
-    if err := binary.Write(c, binary.BigEndian, b); err != nil {
-        return fmt.Errorf("error writing response body: %v", err)
-    }
-    return nil
+
+    // Prepend size
+    size := make([]byte, 4)
+    binary.BigEndian.PutUint32(size, uint32(len(response)))
+    return append(size, response...)
 }
 
 func handleClient(conn net.Conn) {
     defer conn.Close()
-
     fmt.Printf("New client connected: %s\n", conn.RemoteAddr().String())
 
     for {
-        m, err := readMessage(conn)
+        msg, err := readMessage(conn)
         if err != nil {
             if err == io.EOF {
                 fmt.Printf("Client disconnected: %s\n", conn.RemoteAddr().String())
                 return
             }
-            fmt.Printf("Error reading message from %s: %v\n", conn.RemoteAddr().String(), err)
+            fmt.Printf("Error reading message: %v\n", err)
             return
         }
 
-        if m.Error != 0 {
-            out := make([]byte, 6)
-            binary.BigEndian.PutUint32(out, uint32(m.CorrelationID))
-            binary.BigEndian.PutUint16(out[4:], uint16(m.Error))
-            if err := sendResponse(conn, out); err != nil {
-                fmt.Printf("Error sending error response: %v\n", err)
-                return
-            }
-            continue
+        var response []byte
+        switch uint16(msg.APIKey) {
+        case API_VERSION_REQUEST:
+            response = createApiVersionsResponse(msg.CorrelationID, msg.Error)
+        case FETCH_REQUEST:
+            response = handleFetchResponse(msg.CorrelationID)
+        default:
+            fmt.Printf("Unsupported API Key: %d\n", msg.APIKey)
+            return
         }
 
-        response := createResponse(m.CorrelationID)
-        if err := sendResponse(conn, response); err != nil {
+        _, err = conn.Write(response)
+        if err != nil {
             fmt.Printf("Error sending response: %v\n", err)
             return
         }
