@@ -2,6 +2,7 @@ package main
 
 import (
     "encoding/binary"
+    "encoding/hex"
     "fmt"
     "io"
     "net"
@@ -151,7 +152,15 @@ func handleFetchResponse(request *Message) []byte {
 
         // Partition error code (2 bytes)
         partErrorBytes := make([]byte, 2)
-        binary.BigEndian.PutUint16(partErrorBytes, ERROR_UNKNOWN_TOPICID)
+        uuid := hex.EncodeToString(topicID)
+
+        if uuid[12:16] == "4000" {
+            binary.BigEndian.PutUint16(partErrorBytes, 0)
+
+        } else {
+            binary.BigEndian.PutUint16(partErrorBytes, ERROR_UNKNOWN_TOPICID)
+
+        }
         response = append(response, partErrorBytes...)
 
         // Add additional required fields
